@@ -32,10 +32,8 @@ function createSupabaseFetch(supabaseKey: string): typeof fetch {
   };
 }
 
-const FALLBACK_SUPABASE_URL = "https://erdnzwzwrglcsvrscmbc.supabase.co";
-
-function getValidSupabaseUrl(rawUrl?: string): string {
-  if (!rawUrl || typeof rawUrl !== "string") return FALLBACK_SUPABASE_URL;
+function getValidSupabaseUrl(rawUrl?: string): string | null {
+  if (!rawUrl || typeof rawUrl !== "string") return null;
   const trimmed = rawUrl.trim();
   if (
     !trimmed ||
@@ -43,18 +41,16 @@ function getValidSupabaseUrl(rawUrl?: string): string {
     trimmed === "null" ||
     trimmed.includes("placeholder")
   ) {
-    return FALLBACK_SUPABASE_URL;
+    return null;
   }
   if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return trimmed;
   if (trimmed.includes(".") || trimmed.includes("localhost")) return `https://${trimmed}`;
-  return FALLBACK_SUPABASE_URL;
+  return null;
 }
 
-const FALLBACK_SUPABASE_SERVICE_ROLE_KEY = "sb_publishable_mwrV6Ix6hc-2gBQDhd7k7w_M_0fbw1H";
-
-function getValidSupabaseKey(rawKey?: string): string {
+function getValidSupabaseKey(rawKey?: string): string | null {
   if (!rawKey || typeof rawKey !== "string") {
-    return FALLBACK_SUPABASE_SERVICE_ROLE_KEY;
+    return null;
   }
   const trimmed = rawKey.trim();
   if (
@@ -64,7 +60,7 @@ function getValidSupabaseKey(rawKey?: string): string {
     trimmed.includes("placeholder") ||
     trimmed.length < 20
   ) {
-    return FALLBACK_SUPABASE_SERVICE_ROLE_KEY;
+    return null;
   }
   return trimmed;
 }
@@ -75,6 +71,15 @@ function createSupabaseAdminClient() {
 
   const validUrl = getValidSupabaseUrl(SUPABASE_URL);
   const validKey = getValidSupabaseKey(SUPABASE_SERVICE_ROLE_KEY);
+
+  if (!validUrl || !validKey) {
+    console.error(
+      "[Supabase Admin] Missing or invalid SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY",
+    );
+    throw new Error(
+      "Supabase admin environment variables are not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+    );
+  }
 
   return createClient<Database>(validUrl, validKey, {
     global: {
@@ -96,7 +101,14 @@ let _supabaseAdmin: ReturnType<typeof createSupabaseAdminClient> | undefined;
 // Top-level import is safe only in other .server.ts modules - route files and *.functions.ts ship to the client bundle.
 export const supabaseAdmin = new Proxy({} as ReturnType<typeof createSupabaseAdminClient>, {
   get(_, prop, receiver) {
-    if (!_supabaseAdmin) _supabaseAdmin = createSupabaseAdminClient();
+    if (!_supabaseAdmin) {
+      try {
+        _supabaseAdmin = createSupabaseAdminClient();
+      } catch (err) {
+        console.error("[Supabase Admin] Failed to initialize admin client:", err);
+        throw err;
+      }
+    }
     return Reflect.get(_supabaseAdmin, prop, receiver);
   },
 });

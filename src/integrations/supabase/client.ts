@@ -29,11 +29,8 @@ function createSupabaseFetch(supabaseKey: string): typeof fetch {
   };
 }
 
-const FALLBACK_SUPABASE_URL = "https://erdnzwzwrglcsvrscmbc.supabase.co";
-const FALLBACK_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_mwrV6Ix6hc-2gBQDhd7k7w_M_0fbw1H";
-
-function getValidSupabaseUrl(rawUrl?: string): string {
-  if (!rawUrl || typeof rawUrl !== "string") return FALLBACK_SUPABASE_URL;
+function getValidSupabaseUrl(rawUrl?: string): string | null {
+  if (!rawUrl || typeof rawUrl !== "string") return null;
   const trimmed = rawUrl.trim();
   if (
     !trimmed ||
@@ -41,16 +38,16 @@ function getValidSupabaseUrl(rawUrl?: string): string {
     trimmed === "null" ||
     trimmed.includes("placeholder")
   ) {
-    return FALLBACK_SUPABASE_URL;
+    return null;
   }
   if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return trimmed;
   if (trimmed.includes(".") || trimmed.includes("localhost")) return `https://${trimmed}`;
-  return FALLBACK_SUPABASE_URL;
+  return null;
 }
 
-function getValidSupabaseKey(rawKey?: string): string {
+function getValidSupabaseKey(rawKey?: string): string | null {
   if (!rawKey || typeof rawKey !== "string") {
-    return FALLBACK_SUPABASE_PUBLISHABLE_KEY;
+    return null;
   }
   const trimmed = rawKey.trim();
   if (
@@ -60,7 +57,7 @@ function getValidSupabaseKey(rawKey?: string): string {
     trimmed.includes("placeholder") ||
     trimmed.length < 20
   ) {
-    return FALLBACK_SUPABASE_PUBLISHABLE_KEY;
+    return null;
   }
   return trimmed;
 }
@@ -77,6 +74,15 @@ function createSupabaseClient() {
 
   const validUrl = getValidSupabaseUrl(SUPABASE_URL);
   const validKey = getValidSupabaseKey(SUPABASE_PUBLISHABLE_KEY);
+
+  if (!validUrl || !validKey) {
+    console.error(
+      "[Supabase] Missing or invalid VITE_SUPABASE_URL or VITE_SUPABASE_PUBLISHABLE_KEY",
+    );
+    throw new Error(
+      "Supabase environment variables are not configured. Please set VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY.",
+    );
+  }
 
   return createClient<Database>(validUrl, validKey, {
     global: {
@@ -104,15 +110,23 @@ export function isSupabaseConfigured(): boolean {
   const trimmedKey = String(key).trim();
   return (
     trimmedUrl.startsWith("http") &&
-    !trimmedUrl.includes("erdnzwzwrglcsvrscmbc.supabase.co") &&
+    trimmedUrl.length > 10 &&
     !trimmedUrl.includes("placeholder") &&
     trimmedKey.length >= 20 &&
     trimmedKey !== "farooq"
   );
 }
+
 export const supabase = new Proxy({} as ReturnType<typeof createSupabaseClient>, {
   get(_, prop, receiver) {
-    if (!_supabase) _supabase = createSupabaseClient();
+    if (!_supabase) {
+      try {
+        _supabase = createSupabaseClient();
+      } catch (err) {
+        console.error("[Supabase] Failed to initialize client:", err);
+        throw err;
+      }
+    }
     return Reflect.get(_supabase, prop, receiver);
   },
 });
