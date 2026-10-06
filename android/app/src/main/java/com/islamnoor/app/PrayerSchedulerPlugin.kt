@@ -1,13 +1,17 @@
 package com.islamnoor.app
 
+import android.Manifest
 import android.app.AlarmManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
@@ -21,41 +25,94 @@ import java.util.Calendar
 @CapacitorPlugin(name = "PrayerScheduler")
 class PrayerSchedulerPlugin : Plugin() {
 
+    private val tag = "PrayerSched"
     private val names = listOf("Fajr", "Dhuhr", "Asr", "Maghrib", "Isha")
-    private val TAG = "PrayerSched"
 
     private fun meta() = Store.meta(context)
-
-    // ---------------- statut ----------------
 
     @PluginMethod
     fun getNativePlatformStatus(call: PluginCall) {
         val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val canExact = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-            am.canScheduleExactAlarms() else true
+        val exactAllowed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            am.canScheduleExactAlarms()
+        } else {
+            true
+        }
         val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-        call.resolve(JSObject().apply {
-            put("isNativeAndroid", true)
-            put("alarmManagerAvailable", true)
-            put("sdkVersion", Build.VERSION.SDK_INT)
-            put("canScheduleExactAlarms", canExact)
-            put("isIgnoringBatteryOptimizations",
-                pm.isIgnoringBatteryOptimizations(context.packageName))
-        })
+        val postNotificationsAllowed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+
+        call.resolve(
+            JSObject().apply {
+                put("isNativeAndroid", true)
+                put("alarmManagerAvailable", true)
+                put("sdkVersion", Build.VERSION.SDK_INT)
+                put("canScheduleExactAlarms", exactAllowed)
+                put("canPostNotifications", postNotificationsAllowed)
+                put("isIgnoringBatteryOptimizations", pm.isIgnoringBatteryOptimizations(context.packageName))
+            },
+        )
     }
 
     @PluginMethod
     fun requestNativePermissions(call: PluginCall) {
         val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        var ok = true
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (!am.canScheduleExactAlarms()) {
-                try { activity.startActivity(
-                    Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)) } catch (_: Exception) {}
+        var exactAllowed = true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !am.canScheduleExactAlarms()) {
+            try {
+                activity?.startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM))
+            } catch (_: Exception) {
             }
-            ok = am.canScheduleExactAlarms()
         }
-        call.resolve(JSObject().put("canScheduleExactAlarms", ok))
+        exactAllowed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) am.canScheduleExactAlarms() else true
+
+        var postAllowed = true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            postAllowed = ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            if (!postAllowed) {
+                try {
+                    activity?.startActivity(
+                        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                            putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                        },
+                    )
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        call.resolve(
+            JSObject().apply {
+                put("canScheduleExactAlarms", exactAllowed)
+                put("canPostNotifications", postAllowed)
+            },
+        )
+    }
+
+    @PluginMethod
+    fun requestNotificationPermission(call: PluginCall) {
+        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val result = ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+            if (result != PackageManager.PERMISSION_GRANTED) {
+                try {
+                    activity?.startActivity(
+                        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                            putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                        },
+                    )
+                } catch (_: Exception) {
+                }
+                false
+            } else {
+                true
+            }
+        } else {
+            true
+        }
+        call.resolve(JSObject().put("granted", granted))
     }
 
     @PluginMethod
@@ -64,192 +121,179 @@ class PrayerSchedulerPlugin : Plugin() {
             try {
                 val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
                 i.data = Uri.parse("package:" + context.packageName)
-                activity.startActivity(i)
-            } catch (_: Exception) {}
+                activity?.startActivity(i)
+            } catch (_: Exception) {
+            }
         }
         call.resolve(JSObject().put("requested", true))
     }
 
-    // ---------------- CAPTURE de ce que le site envoie ----------------
-
     @PluginMethod
     fun scheduleAdhan(call: PluginCall) {
-        val imamId = call.getString("imamId") ?: ""
-        val url = call.getString("audioUrl") ?: ""
-        val prayer = call.getString("prayerName") ?: ""
-        val msg = call.getString("message") ?: ""
-
-        val e = meta().edit()
-        if (url.startsWith("http")) {
-            if (imamId.isNotEmpty()) e.putString("imam_" + imamId, url)
-            e.putString("lastAdhanUrl", url)
-        }
-        if (imamId.isNotEmpty()) e.putString("lastImamId", imamId)
-        if (msg.isNotEmpty()) e.putString("adhanTpl", Store.tpl(msg, prayer))
-        e.putBoolean("vibA", call.getBoolean("vibrate", true) ?: true)
-        e.apply()
-
-        Log.i(TAG, "CAPTURE adhan imam=" + imamId + " url=" + url.takeLast(30))
-        call.resolve(JSObject().put("success", true)
-            .put("eventId", call.getString("eventId") ?: ""))
+        val eventId = call.getString("eventId") ?: "deprecated-adhan"
+        Log.w(tag, "Deprecated scheduleAdhan invoked; use syncSchedule() instead.")
+        call.resolve(
+            JSObject().apply {
+                put("success", false)
+                put("deprecated", true)
+                put("eventId", eventId)
+            },
+        )
     }
 
     @PluginMethod
     fun scheduleReminder(call: PluginCall) {
-        val prayer = call.getString("prayerName") ?: ""
-        val notif = call.getString("notifText") ?: ""
-        val aTxt = call.getString("audioText") ?: ""
-        val aUrl = call.getString("audioUrl") ?: ""
-
-        val e = meta().edit()
-        if (notif.isNotEmpty()) e.putString("remTpl", Store.tpl(notif, prayer))
-        if (aTxt.isNotEmpty()) e.putString("remAudioText", aTxt)
-        if (aUrl.startsWith("http")) {
-            e.putString("remAudioUrl", aUrl)
-            if (aUrl.contains("text="))
-                e.putString("ttsBase", aUrl.substringBefore("text=") + "text=")
-        }
-        e.putString("remMode", call.getString("mode") ?: "notification")
-        e.putBoolean("vibN", call.getBoolean("vibrate", true) ?: true)
-        e.putString("capSig", meta().getString("curSig", "") ?: "")
-        e.apply()
-
-        Log.i(TAG, "CAPTURE rappel texte=\"" + notif + "\"")
-        call.resolve(JSObject().put("success", true)
-            .put("eventId", call.getString("eventId") ?: ""))
+        val eventId = call.getString("eventId") ?: "deprecated-reminder"
+        Log.w(tag, "Deprecated scheduleReminder invoked; use syncSchedule() instead.")
+        call.resolve(
+            JSObject().apply {
+                put("success", false)
+                put("deprecated", true)
+                put("eventId", eventId)
+            },
+        )
     }
 
     @PluginMethod
     fun cancelAll(call: PluginCall) {
-        call.resolve(JSObject().put("cancelled", true))
+        val count = AlarmStore.cancelAll(context)
+        call.resolve(JSObject().put("cancelled", true).put("count", count))
     }
 
-    // ---------------- diagnostic ----------------
-
     @PluginMethod
-    fun dumpSettings(call: PluginCall) {
-        Log.i("NurSettings", call.getString("settings") ?: "{}")
-        call.resolve(JSObject().put("ok", true))
-    }
-
-    // ---------------- coeur ----------------
-
-    @PluginMethod
-    fun syncAll(call: PluginCall) {
+    fun syncSchedule(call: PluginCall) {
         val timesJson = call.getString("times") ?: return call.reject("times required")
         val notifications = call.getBoolean("notifications", true) ?: true
-        val reminder = call.getInt("reminder") ?: 0
-        val mode = call.getString("mode") ?: "notification"
-        val imamId = call.getString("imamId") ?: ""
+        val reminderMinutes = call.getInt("reminder") ?: 0
+        val mode = call.getString("reminderMode") ?: call.getString("mode") ?: "notification"
+        val imamId = call.getString("imamId") ?: "makkah"
         val origin = call.getString("origin") ?: ""
-        val st = try { JSONObject(call.getString("settings") ?: "{}") }
-                 catch (_: Exception) { JSONObject() }
+        val settingsJson = call.getString("settings") ?: "{}"
 
-        val remSig = listOf(mode, reminder.toString(),
-            st.optString("notifTemplate"), st.optString("customNotifText"),
-            st.optString("audioReminder"), st.optString("customAudioText")
-        ).joinToString("~")
-
-        val sig = timesJson + "|" + notifications + "|" + imamId + "|" + remSig
-        meta().edit().putString("curSig", remSig).apply()
-
-        if (meta().getString("armedSig", "") == sig && AlarmStore.count(context) > 0) {
-            call.resolve(JSObject().put("changed", false)); return
+        val settings = try {
+            JSONObject(settingsJson)
+        } catch (_: Exception) {
+            JSONObject()
         }
 
+        val remSignature = listOf(
+            mode,
+            reminderMinutes.toString(),
+            settings.optString("notifTemplate"),
+            settings.optString("customNotifText"),
+            settings.optString("audioReminder"),
+            settings.optString("customAudioText"),
+        ).joinToString("~")
+
+        val signature = timesJson + "|" + notifications + "|" + imamId + "|" + remSignature
+        meta().edit().putString("curSig", remSignature).apply()
+
         if (!notifications) {
-            AlarmStore.cancelAll(context)
-            meta().edit().putString("armedSig", sig).apply()
-            Log.i(TAG, "notifications OFF -> tout annule")
-            call.resolve(JSObject().put("changed", true).put("armed", 0)); return
+            val cancelled = AlarmStore.cancelAll(context)
+            meta().edit().putString("armedSig", signature).apply()
+            Log.i(tag, "notifications OFF -> cancelled $cancelled alarms")
+            call.resolve(JSObject().put("success", true).put("scheduledCount", 0).put("cancelled", true).put("isNativeAndroid", true))
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val times = try {
+            JSONObject(timesJson)
+        } catch (_: Exception) {
+            JSONObject()
         }
 
         val adhanUrl = Store.adhanUrl(context, imamId)
-        val remText0 = Store.remText(context, remSig, st)
-        val remAudio = if (mode == "notification") ""
-                       else Store.remAudio(context, remSig, st, origin)
-        val vibA = meta().getBoolean("vibA", true)
-        val vibN = meta().getBoolean("vibN", true)
+        val reminderText = Store.remText(context, remSignature, settings)
+        val reminderAudio = if (mode == "notification") "" else Store.remAudio(context, remSignature, settings, origin)
+        val vibAdhan = settings.optBoolean("vibrateAdhan", true)
+        val vibReminder = settings.optBoolean("vibrateNotifications", true)
 
-        val t = JSONObject(timesJson)
-        val now = System.currentTimeMillis()
-        val list = ArrayList<JSONObject>()
+        val agenda = ArrayList<JSONObject>()
 
-        for (n in names) {
-            val p = t.optString(n).split(":")
-            if (p.size != 2) continue
-            val h = p[0].toIntOrNull() ?: continue
-            val mi = p[1].toIntOrNull() ?: continue
+        for (prayerName in names) {
+            val prayerValue = times.optString(prayerName, "")
+            val parts = prayerValue.split(":")
+            if (parts.size != 2) continue
 
-            val c = Calendar.getInstance()
-            c.set(Calendar.HOUR_OF_DAY, h); c.set(Calendar.MINUTE, mi)
-            c.set(Calendar.SECOND, 0); c.set(Calendar.MILLISECOND, 0)
-            var ts = c.timeInMillis
-            if (ts <= now + 30000L) ts += 86400000L
+            val hour = parts[0].toIntOrNull() ?: continue
+            val minute = parts[1].toIntOrNull() ?: continue
 
-            val a = JSONObject()
-            a.put("eventId", "adhan_" + n)
-            a.put("timestampMs", ts)
-            a.put("type", "PRAYER_AZAN")
-            a.put("prayerName", n)
-            a.put("mode", "both")
-            a.put("title", "Islam-Noor \u2014 Adhan " + n)
-            a.put("notifText", Store.adhanText(context, n))
-            a.put("audioUrl", adhanUrl)
-            a.put("vibrate", vibA)
-            a.put("repeat", true)
-            list.add(a)
+            val calendar = Calendar.getInstance()
+            calendar.set(Calendar.HOUR_OF_DAY, hour)
+            calendar.set(Calendar.MINUTE, minute)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
 
-            if (reminder > 0) {
-                val rts = ts - reminder * 60000L
-                if (rts > now + 30000L) {
-                    val r = JSONObject()
-                    r.put("eventId", "rem_" + n)
-                    r.put("timestampMs", rts)
-                    r.put("type", "REMINDER_BEFORE_PRAYER")
-                    r.put("prayerName", n)
-                    r.put("mode", mode)
-                    r.put("title", "Islam-Noor \u2014 Rappel de pri\u00e8re")
-                    r.put("notifText", remText0.replace("{P}", n)
-                        .replace("{M}", reminder.toString()))
-                    r.put("audioUrl", remAudio)
-                    r.put("vibrate", vibN)
-                    r.put("repeat", true)
-                    list.add(r)
+            var adhanTs = calendar.timeInMillis
+            if (adhanTs <= now + 30_000L) {
+                adhanTs += 86_400_000L
+            }
+
+            val adhanPayload = JSONObject().apply {
+                put("eventId", "adhan_${prayerName}")
+                put("timestampMs", adhanTs)
+                put("type", "PRAYER_AZAN")
+                put("prayerName", prayerName)
+                put("mode", "both")
+                put("title", "Islam-Noor — Adhan $prayerName")
+                put("notifText", Store.adhanText(context, prayerName))
+                put("audioUrl", adhanUrl)
+                put("vibrate", vibAdhan)
+                put("repeat", true)
+            }
+            agenda.add(adhanPayload)
+
+            if (reminderMinutes > 0) {
+                val reminderTs = adhanTs - reminderMinutes * 60_000L
+                if (reminderTs > now + 30_000L) {
+                    val reminderPayload = JSONObject().apply {
+                        put("eventId", "rem_${prayerName}")
+                        put("timestampMs", reminderTs)
+                        put("type", "REMINDER_BEFORE_PRAYER")
+                        put("prayerName", prayerName)
+                        put("mode", mode)
+                        put("title", "Islam-Noor — Rappel de prière")
+                        put("notifText", reminderText.replace("{P}", prayerName).replace("{M}", reminderMinutes.toString()))
+                        put("audioUrl", reminderAudio)
+                        put("vibrate", vibReminder)
+                        put("repeat", true)
+                    }
+                    agenda.add(reminderPayload)
                 }
             }
         }
 
-        val armed = AlarmStore.armSet(context, list)
-        meta().edit().putString("armedSig", sig).apply()
-        Log.i(TAG, "syncAll -> " + armed + " alarmes | imam=" + imamId +
-            " mode=" + mode + " rappel=" + reminder)
-        Log.i(TAG, "  texte rappel : " + remText0)
-        Log.i(TAG, "  audio adhan  : " + adhanUrl.takeLast(40))
-        call.resolve(JSObject().put("changed", true).put("armed", armed))
+        val scheduledCount = AlarmStore.armSet(context, agenda)
+        meta().edit().putString("armedSig", signature).apply()
+        Log.i(tag, "syncSchedule -> $scheduledCount alarms for $imamId mode=$mode reminder=$reminderMinutes")
+        call.resolve(JSObject().put("success", true).put("scheduledCount", scheduledCount).put("cancelled", false).put("isNativeAndroid", true))
     }
 
-    // ---------------- tests ----------------
+    @PluginMethod
+    fun syncAll(call: PluginCall) {
+        syncSchedule(call)
+    }
 
     @PluginMethod
     fun scheduleTestAlarm(call: PluginCall) {
-        val delay = call.getInt("delaySeconds") ?: 10
+        val delaySeconds = call.getInt("delaySeconds") ?: 10
         val type = call.getString("type") ?: "adhan"
-        val kind = if (type == "adhan" || type == "PRAYER_AZAN") "adhan" else "rappel"
-        val ok = AlarmStore.schedule(context, TestBuilder.build(context, kind, delay))
-        call.resolve(JSObject().put("success", ok).put("delaySeconds", delay))
+        val ok = AlarmStore.schedule(context, TestBuilder.build(context, if (type == "adhan" || type == "PRAYER_AZAN") "adhan" else "reminder", delaySeconds))
+        call.resolve(JSObject().put("success", ok).put("delaySeconds", delaySeconds))
     }
 
     @PluginMethod
     fun testNow(call: PluginCall) {
-        val o = TestBuilder.build(context, "rappel", 0)
+        val kind = "reminder"
+        val alarm = TestBuilder.build(context, kind, 0)
         val i = Intent(context, PrayerAlarmReceiver::class.java)
-        i.putExtra("type", o.optString("type"))
+        i.putExtra("type", alarm.optString("type"))
         i.putExtra("eventId", "test_now")
-        i.putExtra("mode", o.optString("mode"))
-        i.putExtra("title", o.optString("title"))
-        i.putExtra("notifText", o.optString("notifText"))
-        i.putExtra("audioUrl", o.optString("audioUrl"))
+        i.putExtra("mode", alarm.optString("mode"))
+        i.putExtra("title", alarm.optString("title"))
+        i.putExtra("notifText", alarm.optString("notifText"))
+        i.putExtra("audioUrl", alarm.optString("audioUrl"))
         i.putExtra("vibrate", true)
         context.sendBroadcast(i)
         call.resolve(JSObject().put("sent", true))
@@ -258,103 +302,97 @@ class PrayerSchedulerPlugin : Plugin() {
     @PluginMethod
     fun getPendingAlarms(call: PluginCall) {
         val arr = JSONArray()
-        AlarmStore.prefs(context).all.forEach { (_, v) ->
-            if (v is String) { try { arr.put(JSONObject(v)) } catch (_: Exception) {} }
+        AlarmStore.prefs(context).all.forEach { (_, value) ->
+            if (value is String) {
+                try {
+                    arr.put(JSONObject(value))
+                } catch (_: Exception) {
+                }
+            }
         }
         call.resolve(JSObject().put("alarmsJson", arr.toString()))
     }
 }
 
-// =================== resolution centralisee ===================
-
 object Store {
-
     fun meta(ctx: Context) = ctx.getSharedPreferences("prayer_meta", Context.MODE_PRIVATE)
 
     fun tpl(text: String, prayer: String): String =
         if (prayer.isNotEmpty() && text.contains(prayer)) text.replace(prayer, "{P}") else text
 
     fun adhanUrl(ctx: Context, imamId: String): String {
-        val m = meta(ctx)
-        val exact = m.getString("imam_" + imamId, "") ?: ""
+        val meta = meta(ctx)
+        val exact = meta.getString("imam_" + imamId, "") ?: ""
         if (exact.startsWith("http")) return exact
-        val last = m.getString("lastAdhanUrl", "") ?: ""
+        val last = meta.getString("lastAdhanUrl", "") ?: ""
         if (last.startsWith("http")) return last
         return "https://cdn.jsdelivr.net/gh/Kiwifu/adhan-mp3@main/Ali_Ibn_Ahmad_Mala_HQ.mp3"
     }
 
     fun adhanText(ctx: Context, prayer: String): String {
-        val t = meta(ctx).getString("adhanTpl", "") ?: ""
-        return if (t.isNotEmpty()) t.replace("{P}", prayer)
-               else "La pri\u00e8re de " + prayer + " commence."
+        val text = meta(ctx).getString("adhanTpl", "") ?: ""
+        return if (text.isNotEmpty()) text.replace("{P}", prayer) else "La prière de $prayer commence."
     }
 
-    private fun isCustom(v: String): Boolean {
-        val s = v.lowercase()
-        return s.contains("custom") || s.contains("perso") || s.contains("own")
+    private fun isCustom(value: String): Boolean {
+        val lowered = value.lowercase()
+        return lowered.contains("custom") || lowered.contains("perso") || lowered.contains("own")
     }
 
-    fun remText(ctx: Context, remSig: String, st: JSONObject): String {
-        val m = meta(ctx)
-        val custom = st.optString("customNotifText", "").trim()
-        val fresh = m.getString("capSig", "") == remSig
-        val cap = m.getString("remTpl", "") ?: ""
+    fun remText(ctx: Context, remSig: String, settings: JSONObject): String {
+        val custom = settings.optString("customNotifText", "").trim()
+        val meta = meta(ctx)
+        val cap = meta.getString("remTpl", "") ?: ""
+        val fresh = meta.getString("capSig", "") == remSig
 
-        if (custom.isNotEmpty() && isCustom(st.optString("notifTemplate"))) return custom
+        if (custom.isNotEmpty() && isCustom(settings.optString("notifTemplate"))) return custom
         if (fresh && cap.isNotEmpty()) return cap
         if (cap.isNotEmpty()) return cap
         if (custom.isNotEmpty()) return custom
         return "L'adhan de {P} commence dans {M} minutes."
     }
 
-    fun remAudio(ctx: Context, remSig: String, st: JSONObject, origin: String): String {
-        val m = meta(ctx)
-        val custom = st.optString("customAudioText", "").trim()
-        val fresh = m.getString("capSig", "") == remSig
-        val capUrl = m.getString("remAudioUrl", "") ?: ""
+    fun remAudio(ctx: Context, remSig: String, settings: JSONObject, origin: String): String {
+        val meta = meta(ctx)
+        val custom = settings.optString("customAudioText", "").trim()
+        val capUrl = meta.getString("remAudioUrl", "") ?: ""
+        val fresh = meta.getString("capSig", "") == remSig
 
-        if (custom.isNotEmpty() && isCustom(st.optString("audioReminder"))) {
-            var base = m.getString("ttsBase", "") ?: ""
+        if (custom.isNotEmpty() && isCustom(settings.optString("audioReminder"))) {
+            var base = meta.getString("ttsBase", "") ?: ""
             if (base.isEmpty()) {
-                val o = if (origin.startsWith("http")) origin
-                        else "https://fortuite-424120936603.europe-west2.run.app"
-                base = o + "/api/tts?voice=alloy&text="
+                val fallback = if (origin.startsWith("http")) origin else "https://fortuite-424120936603.europe-west2.run.app"
+                base = fallback + "/api/tts?voice=alloy&text="
             }
             return base + URLEncoder.encode(custom, "UTF-8").replace("+", "%20")
         }
+        if (fresh && capUrl.startsWith("http")) return capUrl
         if (capUrl.startsWith("http")) return capUrl
-        val o = if (origin.startsWith("http")) origin
-                else "https://fortuite-424120936603.europe-west2.run.app"
-        return o + "/api/tts?voice=alloy&text=" +
-            URLEncoder.encode("Il est temps de se pr\u00e9parer pour la pri\u00e8re.", "UTF-8")
-                .replace("+", "%20")
+        val base = if (origin.startsWith("http")) origin else "https://fortuite-424120936603.europe-west2.run.app"
+        return base + "/api/tts?voice=alloy&text=" + URLEncoder.encode("Il est temps de se préparer pour la prière.", "UTF-8").replace("+", "%20")
     }
 }
 
 object TestBuilder {
-    fun build(ctx: Context, kind: String, delay: Int): JSONObject {
-        val adhan = kind == "adhan"
-        val m = Store.meta(ctx)
-        val mode = if (adhan) "both" else (m.getString("remMode", "notification") ?: "notification")
-        val o = JSONObject()
-        o.put("eventId", "realtest_" + kind)
-        o.put("timestampMs", System.currentTimeMillis() + delay * 1000L)
-        o.put("type", if (adhan) "PRAYER_AZAN" else "REMINDER_BEFORE_PRAYER")
-        o.put("prayerName", "Fajr")
-        o.put("mode", mode)
-        o.put("title", if (adhan) "Islam-Noor \u2014 Adhan Fajr"
-                       else "Islam-Noor \u2014 Rappel de pri\u00e8re")
-        o.put("notifText", if (adhan) Store.adhanText(ctx, "Fajr")
-            else (m.getString("remTpl", "") ?: "").ifEmpty {
-                "L'adhan de {P} commence dans {M} minutes." }
-                .replace("{P}", "Fajr").replace("{M}", "30"))
-        o.put("audioUrl", when {
-            adhan -> Store.adhanUrl(ctx, m.getString("lastImamId", "") ?: "")
+    fun build(ctx: Context, kind: String, delaySeconds: Int): JSONObject {
+        val isAdhan = kind == "adhan"
+        val meta = Store.meta(ctx)
+        val mode = if (isAdhan) "both" else (meta.getString("remMode", "notification") ?: "notification")
+        val obj = JSONObject()
+        obj.put("eventId", "realtest_${kind}")
+        obj.put("timestampMs", System.currentTimeMillis() + delaySeconds * 1000L)
+        obj.put("type", if (isAdhan) "PRAYER_AZAN" else "REMINDER_BEFORE_PRAYER")
+        obj.put("prayerName", "Fajr")
+        obj.put("mode", mode)
+        obj.put("title", if (isAdhan) "Islam-Noor — Adhan Fajr" else "Islam-Noor — Rappel de prière")
+        obj.put("notifText", if (isAdhan) Store.adhanText(ctx, "Fajr") else (meta.getString("remTpl", "") ?: "").ifEmpty { "L'adhan de {P} commence dans {M} minutes." }.replace("{P}", "Fajr").replace("{M}", "30"))
+        obj.put("audioUrl", when {
+            isAdhan -> Store.adhanUrl(ctx, meta.getString("lastImamId", "") ?: "")
             mode == "notification" -> ""
-            else -> m.getString("remAudioUrl", "") ?: ""
+            else -> meta.getString("remAudioUrl", "") ?: ""
         })
-        o.put("vibrate", true)
-        o.put("repeat", false)
-        return o
+        obj.put("vibrate", true)
+        obj.put("repeat", false)
+        return obj
     }
 }

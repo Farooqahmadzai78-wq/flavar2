@@ -1,7 +1,7 @@
 import { Capacitor, registerPlugin } from "@capacitor/core";
-import { AppSettings } from "@/lib/app-settings";
+import type { Settings as AppSettings } from "@/lib/app-settings";
 import { IMAMS } from "@/lib/nur-data";
-import { PRAYER_KEYS, PrayerTimings, toDateToday } from "@/lib/prayer-times";
+import { PRAYER_KEYS, type PrayerTimings, toDateToday } from "@/lib/prayer-times";
 import { resolveEffectiveReminder, ttsUrl } from "@/lib/reminder-data";
 
 export interface NativePlatformStatus {
@@ -29,8 +29,8 @@ export interface ScheduledAlarmInfo {
 
 export interface PrayerSchedulerPluginInterface {
   getNativePlatformStatus(): Promise<NativePlatformStatus>;
-  requestNativePermissions(): Promise<{ canScheduleExactAlarms: boolean }>;
-  requestBatteryOptimizationExemption(): Promise<{ requested: boolean }>;
+  requestNativePermissions(): Promise<{ canScheduleExactAlarms: boolean; canPostNotifications: boolean }>;
+  requestNotificationPermission(): Promise<{ granted: boolean }>; 
   scheduleReminder(options: {
     eventId: string;
     prayerName: string;
@@ -43,7 +43,7 @@ export interface PrayerSchedulerPluginInterface {
     audioUrl?: string;
     isArabic?: boolean;
     vibrate?: boolean;
-  }): Promise<{ success: boolean; eventId: string }>;
+  }): Promise<{ success: boolean; eventId: string; deprecated?: boolean }>; 
   scheduleAdhan(options: {
     eventId: string;
     prayerName: string;
@@ -53,7 +53,16 @@ export interface PrayerSchedulerPluginInterface {
     message: string;
     audioUrl: string;
     vibrate?: boolean;
-  }): Promise<{ success: boolean; eventId: string }>;
+  }): Promise<{ success: boolean; eventId: string; deprecated?: boolean }>;
+  syncSchedule(options: {
+    times: string;
+    notifications?: boolean;
+    reminder?: number;
+    reminderMode?: string;
+    imamId?: string;
+    origin?: string;
+    settings?: string;
+  }): Promise<{ success: boolean; scheduledCount: number; cancelled?: boolean; isNativeAndroid: boolean }>;
   scheduleTestAlarm(options: {
     delaySeconds: number;
     type: "reminder" | "adhan" | "REMINDER_BEFORE_PRAYER" | "PRAYER_AZAN";
@@ -68,23 +77,15 @@ export interface PrayerSchedulerPluginInterface {
     vibrate?: boolean;
   }): Promise<{ success: boolean; eventId: string; timestampMs: number; delaySeconds: number }>;
   getPendingAlarms(): Promise<{ alarmsJson: string }>;
-  cancelAll(): Promise<{ cancelled: boolean }>;
+  cancelAll(): Promise<{ cancelled: boolean; count: number }>;
 }
 
-export const NativePrayerScheduler =
-  registerPlugin<PrayerSchedulerPluginInterface>("PrayerScheduler");
+export const NativePrayerScheduler = registerPlugin<PrayerSchedulerPluginInterface>("PrayerScheduler");
 
 export function isNativeAndroidPlatform(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    Capacitor.isNativePlatform() &&
-    Capacitor.getPlatform() === "android"
-  );
+  return typeof window !== "undefined" && Capacitor.isNativePlatform() && Capacitor.getPlatform() === "android";
 }
 
-/**
- * Checks platform status (Exact alarms, battery optimization, Android SDK).
- */
 export async function getNativeStatus(): Promise<NativePlatformStatus> {
   if (!isNativeAndroidPlatform()) {
     return {
@@ -95,6 +96,7 @@ export async function getNativeStatus(): Promise<NativePlatformStatus> {
       isIgnoringBatteryOptimizations: true,
     };
   }
+
   try {
     return await NativePrayerScheduler.getNativePlatformStatus();
   } catch {
@@ -108,37 +110,37 @@ export async function getNativeStatus(): Promise<NativePlatformStatus> {
   }
 }
 
-/**
- * Requests exact alarm permissions on Android 12+ (SDK 31+)
- */
 export async function requestNativeExactAlarmPermissions(): Promise<boolean> {
   if (!isNativeAndroidPlatform()) return true;
   try {
     const res = await NativePrayerScheduler.requestNativePermissions();
-    return res.canScheduleExactAlarms;
+    return Boolean(res.canScheduleExactAlarms);
   } catch {
     return true;
   }
 }
 
-/**
- * Prompts the user to exempt Islam-Noor from battery optimization for 100% reliable background execution.
- */
+export async function requestNotificationPermission(): Promise<boolean> {
+  if (!isNativeAndroidPlatform()) return true;
+  try {
+    const res = await NativePrayerScheduler.requestNotificationPermission();
+    return Boolean(res.granted);
+  } catch {
+    return true;
+  }
+}
+
 export async function requestNativeBatteryExemption(): Promise<boolean> {
   if (!isNativeAndroidPlatform()) return true;
   try {
     const res = await NativePrayerScheduler.requestBatteryOptimizationExemption();
-    return res.requested;
+    return Boolean(res.requested);
   } catch {
     return false;
   }
 }
 
-/**
- * Synchronizes prayer timings and pre-adhan settings with native Android AlarmManager.
- * When on Web/PWA, returns status indicating fallback to Service Worker / in-app scheduler.
- */
-export async function syncNativePrayerAlarms(
+export async function syncSchedule(
   timings: PrayerTimings,
   settings: AppSettings,
   t: (key: string) => string,
@@ -160,78 +162,39 @@ export async function syncNativePrayerAlarms(
     return { nativeScheduledCount: 0, isNative: false };
   }
 
-  let scheduledCount = 0;
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const settingsPayload = JSON.stringify({
+    notifTemplate: settings.notifTemplate,
+    customNotifText: settings.customNotifText,
+    audioReminder: settings.audioReminder,
+    customAudioText: settings.customAudioText,
+    vibrateNotifications: settings.vibrateNotifications,
+    vibrateAdhan: settings.vibrateAdhan,
+  });
 
   try {
-    // 1. Clear old scheduled alarms before rescheduling
-    await NativePrayerScheduler.cancelAll();
+    const result = await NativePrayerScheduler.syncSchedule({
+      times: JSON.stringify(timings),
+      notifications: settings.notifications,
+      reminder: settings.reminder ?? 0,
+      reminderMode: settings.reminderMode ?? "notification",
+      imamId: settings.imamId ?? "makkah",
+      origin,
+      settings: settingsPayload,
+    });
 
-    const now = new Date();
-    const dateStr = now.toISOString().split("T")[0];
-    const imam = IMAMS.find((i) => i.id === settings.imamId) ?? IMAMS[0];
-    const origin = typeof window !== "undefined" ? window.location.origin : "";
-
-    for (const key of PRAYER_KEYS) {
-      const adhanTime = toDateToday(timings[key], now);
-      if (isNaN(adhanTime.getTime())) continue;
-
-      const adhanTimeMs = adhanTime.getTime();
-
-      // A. Pre-Adhan Reminder Exact Alarm
-      if (settings.reminder > 0) {
-        const reminderTimeMs = adhanTimeMs - settings.reminder * 60_000;
-
-        if (reminderTimeMs > now.getTime()) {
-          const remEventId = `rem_${key}_${dateStr}_${settings.reminder}_${settings.reminderMode}`;
-          const resolved = resolveEffectiveReminder(settings, key, t);
-
-          const relTtsUrl = ttsUrl(resolved.audioText, resolved.isArabicAudio);
-          const fullAudioUrl = relTtsUrl.startsWith("http") ? relTtsUrl : `${origin}${relTtsUrl}`;
-
-          await NativePrayerScheduler.scheduleReminder({
-            eventId: remEventId,
-            prayerName: key,
-            timestamp: reminderTimeMs,
-            mode: resolved.mode,
-            title: "Islam-Noor — Rappel de prière",
-            notifText: resolved.notifText,
-            message: resolved.notifText,
-            audioText: resolved.audioText,
-            audioUrl: fullAudioUrl,
-            isArabic: resolved.isArabicAudio,
-            vibrate: settings.vibrateNotifications,
-          });
-          scheduledCount++;
-        }
-      }
-
-      // B. Exact Adhan Alarm
-      if (adhanTimeMs > now.getTime()) {
-        const adhanEventId = `adhan_${key}_${dateStr}_${settings.imamId}`;
-
-        await NativePrayerScheduler.scheduleAdhan({
-          eventId: adhanEventId,
-          prayerName: key,
-          timestamp: adhanTimeMs,
-          imamId: settings.imamId,
-          title: `Islam-Noor — Adhan ${key}`,
-          message: `Il est l'heure de la prière de ${key} (${imam.name})`,
-          audioUrl: imam.audio,
-          vibrate: settings.vibrateAdhan,
-        });
-        scheduledCount++;
-      }
-    }
+    return {
+      nativeScheduledCount: result?.scheduledCount ?? 0,
+      isNative: true,
+    };
   } catch (err) {
-    console.warn("[NativePrayerBridge] Failed to sync native alarms:", err);
+    console.warn("[NativePrayerBridge] syncSchedule failed:", err);
+    return { nativeScheduledCount: 0, isNative: true };
   }
-
-  return { nativeScheduledCount: scheduledCount, isNative: true };
 }
 
-/**
- * Schedules a native test alarm after a given delay (in seconds) to test closed-app and locked-screen triggers.
- */
+export const syncNativePrayerAlarms = syncSchedule;
+
 export async function scheduleNativeTestDelay(options: {
   delaySeconds: number;
   type: "reminder" | "adhan" | "REMINDER_BEFORE_PRAYER" | "PRAYER_AZAN";
@@ -254,7 +217,6 @@ export async function scheduleNativeTestDelay(options: {
     }
   }
 
-  // Fallback for Web/PWA
   const targetMs = Date.now() + options.delaySeconds * 1000;
   return {
     success: true,
@@ -263,9 +225,6 @@ export async function scheduleNativeTestDelay(options: {
   };
 }
 
-/**
- * Fetches and parses the list of pending Android AlarmManager alarms.
- */
 export async function getParsedScheduledAlarms(): Promise<ScheduledAlarmInfo[]> {
   if (!isNativeAndroidPlatform()) return [];
   try {
@@ -278,4 +237,64 @@ export async function getParsedScheduledAlarms(): Promise<ScheduledAlarmInfo[]> 
     console.warn("[NativePrayerBridge] Error fetching pending alarms:", err);
     return [];
   }
+}
+
+export async function cancelScheduledNativeAlarms(): Promise<boolean> {
+  if (!isNativeAndroidPlatform()) return true;
+  try {
+    const res = await NativePrayerScheduler.cancelAll();
+    return Boolean(res.cancelled);
+  } catch {
+    return false;
+  }
+}
+
+export async function validateNativeScheduleState(): Promise<{ canScheduleExactAlarms: boolean; canPostNotifications: boolean }> {
+  if (!isNativeAndroidPlatform()) {
+    return { canScheduleExactAlarms: true, canPostNotifications: true };
+  }
+
+  try {
+    const res = await NativePrayerScheduler.requestNativePermissions();
+    return {
+      canScheduleExactAlarms: Boolean(res.canScheduleExactAlarms),
+      canPostNotifications: Boolean(res.canPostNotifications),
+    };
+  } catch {
+    return { canScheduleExactAlarms: true, canPostNotifications: true };
+  }
+}
+
+export function getPrayerScheduleSignature(timings: PrayerTimings, settings: AppSettings): string {
+  return `${PRAYER_KEYS.map((key) => `${key}:${timings[key] ?? ""}`).join("|")}|${settings.imamId}|${settings.reminder}|${settings.reminderMode}|${settings.notifications}`;
+}
+
+export function getReminderLeadTime(settings: AppSettings): number {
+  return settings.reminder ?? 0;
+}
+
+export function getSinglePrayerTime(timings: PrayerTimings, prayer: keyof PrayerTimings): string {
+  return timings[prayer] ?? "00:00";
+}
+
+export function buildReminderTime(prayerTime: string, minutesBefore: number): number {
+  const [hour, minute] = prayerTime.split(":").map(Number);
+  const base = new Date();
+  base.setHours(hour, minute, 0, 0);
+  return base.getTime() - minutesBefore * 60_000;
+}
+
+export function createPrayerReminderWindow(
+  timings: PrayerTimings,
+  settings: AppSettings,
+): Array<{ prayerName: string; prayerTime: Date; reminderTime: Date }> {
+  return PRAYER_KEYS.map((key) => {
+    const prayerTime = toDateToday(timings[key], new Date());
+    const reminderTime = new Date(prayerTime.getTime() - (settings.reminder ?? 0) * 60_000);
+    return { prayerName: key, prayerTime, reminderTime };
+  }).filter((item) => !Number.isNaN(item.prayerTime.getTime()));
+}
+
+export function hasNativeSchedulingConflict(settings: AppSettings): boolean {
+  return Boolean(settings.notifications && isNativeAndroidPlatform());
 }

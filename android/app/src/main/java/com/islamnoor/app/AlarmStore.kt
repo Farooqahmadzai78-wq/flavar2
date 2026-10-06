@@ -11,15 +11,15 @@ import org.json.JSONObject
 object AlarmStore {
 
     private const val PREFS = "prayer_alarms"
-    private const val DAY_MS = 86400000L
+    private const val DAY_MS = 86_400_000L
     private const val TAG = "AlarmStore"
 
     fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    private fun am(ctx: Context) =
+    private fun am(ctx: Context): AlarmManager =
         ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
 
-    fun buildIntent(ctx: Context, o: JSONObject): Intent {
+    private fun buildIntent(ctx: Context, o: JSONObject): Intent {
         val i = Intent(ctx, PrayerAlarmReceiver::class.java)
         i.action = "com.islamnoor.app.ALARM." + o.optString("eventId")
         i.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES or Intent.FLAG_RECEIVER_FOREGROUND)
@@ -35,65 +35,89 @@ object AlarmStore {
         return i
     }
 
-    private fun cancelOne(ctx: Context, o: JSONObject) {
+    private fun cancelOne(ctx: Context, eventId: String) {
         try {
             val pi = PendingIntent.getBroadcast(
-                ctx, o.optString("eventId").hashCode(), buildIntent(ctx, o),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                ctx,
+                eventId.hashCode(),
+                Intent(ctx, PrayerAlarmReceiver::class.java).apply {
+                    action = "com.islamnoor.app.ALARM.$eventId"
+                    putExtra("eventId", eventId)
+                },
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE,
             )
-            am(ctx).cancel(pi)
-            pi.cancel()
-        } catch (_: Exception) {}
+            if (pi != null) {
+                am(ctx).cancel(pi)
+                pi.cancel()
+            }
+        } catch (_: Exception) {
+        }
     }
 
     fun schedule(ctx: Context, o: JSONObject): Boolean {
-        val eventId = o.optString("eventId")
+        val eventId = o.optString("eventId", "")
         if (eventId.isEmpty()) return false
-        var ts = o.optLong("timestampMs")
+
+        var ts = o.optLong("timestampMs", 0L)
         if (ts <= 0L) return false
 
         val repeat = o.optBoolean("repeat", true)
         val now = System.currentTimeMillis()
-        if (ts <= now + 1000L) {
-            if (!repeat) { prefs(ctx).edit().remove(eventId).apply(); return false }
-            while (ts <= now + 1000L) ts += DAY_MS
+        if (ts <= now + 1_000L) {
+            if (!repeat) {
+                prefs(ctx).edit().remove(eventId).apply()
+                return false
+            }
+            while (ts <= now + 1_000L) {
+                ts += DAY_MS
+            }
         }
         o.put("timestampMs", ts)
 
         val pi = PendingIntent.getBroadcast(
-            ctx, eventId.hashCode(), buildIntent(ctx, o),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            ctx,
+            eventId.hashCode(),
+            buildIntent(ctx, o),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+
         try {
             val alarm = am(ctx)
-            val exact = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-                alarm.canScheduleExactAlarms() else true
-            if (exact) {
-                val show = PendingIntent.getActivity(
-                    ctx, 9000,
-                    Intent(ctx, MainActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    },
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-                alarm.setAlarmClock(AlarmManager.AlarmClockInfo(ts, show), pi)
+            val canScheduleExact = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                alarm.canScheduleExactAlarms()
+            } else {
+                true
+            }
+
+            if (canScheduleExact) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarm.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, ts, pi)
+                } else {
+                    alarm.setExact(AlarmManager.RTC_WAKEUP, ts, pi)
+                }
             } else {
                 alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, ts, pi)
             }
         } catch (e: Exception) {
-            Log.w(TAG, "schedule err: " + e); return false
+            Log.w(TAG, "schedule err: $e")
+            return false
         }
+
         prefs(ctx).edit().putString(eventId, o.toString()).apply()
-        Log.i(TAG, "arme " + eventId + " @ " + ts)
+        Log.i(TAG, "armed $eventId @ $ts")
         return true
     }
 
     fun armSet(ctx: Context, items: List<JSONObject>): Int {
         cancelAll(ctx)
-        var n = 0
-        for (o in items) if (schedule(ctx, o)) n++
-        Log.i(TAG, "armSet -> " + n + " alarmes")
-        return n
+        var scheduled = 0
+        for (item in items) {
+            if (schedule(ctx, item)) {
+                scheduled += 1
+            }
+        }
+        Log.i(TAG, "armSet -> $scheduled alarms")
+        return scheduled
     }
 
     fun rescheduleNextDay(ctx: Context, eventId: String) {
@@ -101,30 +125,43 @@ object AlarmStore {
         try {
             val o = JSONObject(raw)
             if (!o.optBoolean("repeat", true)) {
-                prefs(ctx).edit().remove(eventId).apply(); return
+                prefs(ctx).edit().remove(eventId).apply()
+                return
             }
             o.put("timestampMs", o.optLong("timestampMs") + DAY_MS)
             schedule(ctx, o)
-        } catch (e: Exception) { Log.w(TAG, "reschedule err: " + e) }
+        } catch (e: Exception) {
+            Log.w(TAG, "reschedule err: $e")
+        }
     }
 
     fun restoreAll(ctx: Context): Int {
-        var n = 0
-        HashMap(prefs(ctx).all).forEach { (_, v) ->
-            if (v is String) { try { if (schedule(ctx, JSONObject(v))) n++ } catch (_: Exception) {} }
+        var restored = 0
+        val entries = HashMap(prefs(ctx).all)
+        entries.forEach { (_, value) ->
+            if (value is String) {
+                try {
+                    if (schedule(ctx, JSONObject(value))) {
+                        restored += 1
+                    }
+                } catch (_: Exception) {
+                }
+            }
         }
-        Log.i(TAG, "restore " + n + " alarmes")
-        return n
+        Log.i(TAG, "restore $restored alarms")
+        return restored
     }
 
-    fun cancelAll(ctx: Context) {
-        HashMap(prefs(ctx).all).forEach { (k, v) ->
-            try {
-                val o = if (v is String) JSONObject(v) else JSONObject().put("eventId", k)
-                cancelOne(ctx, o)
-            } catch (_: Exception) {}
+    fun cancelAll(ctx: Context): Int {
+        var count = 0
+        val entries = HashMap(prefs(ctx).all)
+        entries.forEach { (key, _) ->
+            count += 1
+            cancelOne(ctx, key)
         }
         prefs(ctx).edit().clear().apply()
+        Log.i(TAG, "cancelAll -> $count alarms")
+        return count
     }
 
     fun count(ctx: Context): Int = prefs(ctx).all.size
