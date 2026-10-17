@@ -1,6 +1,12 @@
 import { createServerFn } from "@tanstack/react-start";
+import { getRequest } from "@tanstack/react-start/server";
 import { z } from "zod";
 import { GoogleGenAI } from "@google/genai";
+import {
+  checkAiRateLimit,
+  extractClientKey,
+  rateLimitError,
+} from "./ai-rate-limit";
 
 const translateSchema = z.object({
   text: z.string().min(1).max(5000),
@@ -18,7 +24,7 @@ export type TranslateResult = {
 // In-memory server cache to avoid redundant API calls
 const translationCache = new Map<string, string>();
 
-export async function translateTextInternal(
+async function translateTextInternal(
   text: string,
   targetLang: string,
   sourceLang?: string,
@@ -63,6 +69,13 @@ ${text}`;
 export const translateTextServerFn = createServerFn({ method: "POST" })
   .validator((data: unknown) => translateSchema.parse(data))
   .handler(async ({ data }): Promise<TranslateResult> => {
+    const request = getRequest();
+    const decision = await checkAiRateLimit("translate", {
+      request,
+      key: extractClientKey(request?.headers),
+    });
+    if (!decision.allowed) throw rateLimitError("translate", decision.retryAfterSec);
+
     const { text, targetLang, sourceLang } = data;
     const translated = await translateTextInternal(text, targetLang, sourceLang);
     return {

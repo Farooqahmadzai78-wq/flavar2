@@ -1,10 +1,23 @@
 import { createServerFn } from "@tanstack/react-start";
+import { getRequest } from "@tanstack/react-start/server";
+import {
+  checkAiRateLimit,
+  extractClientKey,
+  rateLimitError,
+} from "./ai-rate-limit";
+import { buildTtsProviderPayload, ttsSchema } from "./tts-validation";
 
 export const getTtsAudio = createServerFn({ method: "GET" })
-  .validator((data: unknown) => data as { text: string; voice?: string })
+  .validator((data: unknown) => ttsSchema.parse(data))
   .handler(async ({ data }) => {
-    const text = (data.text ?? "").slice(0, 400);
-    const voice = data.voice === "onyx" ? "onyx" : "alloy";
+    const request = getRequest();
+    const decision = await checkAiRateLimit("tts", {
+      request,
+      key: extractClientKey(request?.headers),
+    });
+    if (!decision.allowed) throw rateLimitError("tts", decision.retryAfterSec);
+
+    const { text, voice } = buildTtsProviderPayload(data);
     if (!text) throw new Error("Missing text");
 
     const res = await fetch("https://ai.gateway.lovable.dev/v1/audio/speech", {

@@ -1,13 +1,20 @@
 import { createServerFn } from "@tanstack/react-start";
+import { getRequest } from "@tanstack/react-start/server";
 import { z } from "zod";
 import { GoogleGenAI } from "@google/genai";
-
-const schema = z.object({
-  /** data URL of the ingredient-list photo */
-  image: z.string().min(32).max(8_000_000),
-  lang: z.string().max(8).default("fr"),
-  analysisId: z.string().optional(),
-});
+import {
+  checkAiRateLimit,
+  extractClientKey,
+  rateLimitError,
+} from "./ai-rate-limit";
+import {
+  accessTokenHashesMatch,
+  canTransition,
+  evaluateTokenBinding,
+  hashAccessToken,
+  isValidAccessToken,
+} from "./ingredient-job-security";
+import { analyzeIngredientsSchema, accessTokenSchema } from "./ingredient-validation";
 
 export type IngredientAnalysis = {
   name: string;
@@ -28,6 +35,8 @@ type AnalysisJob = {
   error?: string;
   createdAt: number;
   updatedAt: number;
+  /** SHA-256 hash of the access token. The raw token is never stored. */
+  tokenHash?: string;
 };
 
 // Global in-memory job store on the server
@@ -40,6 +49,61 @@ function cleanupExpiredJobs() {
       serverAnalysisJobs.delete(id);
     }
   }
+}
+
+/**
+ * Binds an incoming access token to a job. Returns the existing job when one is
+ * already present, `undefined` when none exists yet, or `null` on a token
+ * conflict (job bound to a different token) — in which case the job is left
+ * untouched. The first caller establishes the association; later callers with
+ * the same token keep it; a different token is rejected without side effects.
+ */
+async function bindJobToken(
+  analysisId: string,
+  accessToken: string,
+): Promise<AnalysisJob | undefined | null> {
+  const incomingHash = await hashAccessToken(accessToken);
+  const existing = serverAnalysisJobs.get(analysisId);
+  if (existing) {
+    const decision = evaluateTokenBinding(existing.tokenHash, incomingHash);
+    if (decision === "conflict") return null;
+    if (decision === "establish") existing.tokenHash = incomingHash;
+    return existing;
+  }
+  return undefined;
+}
+
+/** Creates a fresh job entry bound to the token hash. */
+function createJob(analysisId: string, tokenHash: string): AnalysisJob {
+  const now = Date.now();
+  const job: AnalysisJob = {
+    id: analysisId,
+    status: "processing",
+    tokenHash,
+    createdAt: now,
+    updatedAt: now,
+  };
+  serverAnalysisJobs.set(analysisId, job);
+  return job;
+}
+
+/**
+ * Applies a terminal transition (completed/failed) while preserving the token
+ * binding and respecting terminal-state immutability (a late update never
+ * replaces an already-finished result).
+ */
+function finalizeJob(
+  analysisId: string,
+  next: "completed" | "failed",
+  patch: { result?: IngredientAnalysis; error?: string },
+): void {
+  const job = serverAnalysisJobs.get(analysisId);
+  if (!job) return;
+  if (!canTransition(job.status, next)) return;
+  job.status = next;
+  job.updatedAt = Date.now();
+  if (next === "completed") job.result = patch.result;
+  if (next === "failed") job.error = patch.error;
 }
 
 async function performAiIngredientAnalysis(image: string, lang: string): Promise<IngredientAnalysis> {
@@ -157,44 +221,36 @@ async function performAiIngredientAnalysis(image: string, lang: string): Promise
 
 /** Reads a photo of an ingredient list and returns a halal verdict directly. */
 export const analyzeIngredientsPhoto = createServerFn({ method: "POST" })
-  .inputValidator((d: unknown) => schema.parse(d))
+  .inputValidator((d: unknown) => analyzeIngredientsSchema.parse(d))
   .handler(async ({ data }): Promise<IngredientAnalysis> => {
+    const request = getRequest();
+    const decision = await checkAiRateLimit("ingredientAnalyze", {
+      request,
+      key: extractClientKey(request?.headers),
+    });
+    if (!decision.allowed) throw rateLimitError("ingredientAnalyze", decision.retryAfterSec);
+
     cleanupExpiredJobs();
 
-    if (data.analysisId) {
-      serverAnalysisJobs.set(data.analysisId, {
-        id: data.analysisId,
-        status: "processing",
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      });
+    // P1: analysisId + accessToken are mandatory and validated BEFORE any AI
+    // call, so the quota cannot be consumed by an unauthenticated request.
+    if (!isValidAccessToken(data.accessToken)) {
+      throw new Error("Unauthorized");
     }
+
+    const bind = await bindJobToken(data.analysisId, data.accessToken);
+    if (bind === null) throw new Error("Unauthorized");
+    if (!bind) createJob(data.analysisId, await hashAccessToken(data.accessToken));
 
     try {
       const result = await performAiIngredientAnalysis(data.image, data.lang);
 
-      if (data.analysisId) {
-        serverAnalysisJobs.set(data.analysisId, {
-          id: data.analysisId,
-          status: "completed",
-          result,
-          createdAt: serverAnalysisJobs.get(data.analysisId)?.createdAt || Date.now(),
-          updatedAt: Date.now(),
-        });
-      }
+      finalizeJob(data.analysisId, "completed", { result });
 
       return result;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      if (data.analysisId) {
-        serverAnalysisJobs.set(data.analysisId, {
-          id: data.analysisId,
-          status: "failed",
-          error: errMsg,
-          createdAt: serverAnalysisJobs.get(data.analysisId)?.createdAt || Date.now(),
-          updatedAt: Date.now(),
-        });
-      }
+      finalizeJob(data.analysisId, "failed", { error: errMsg });
       throw err;
     }
   });
@@ -207,44 +263,44 @@ export const startIngredientAnalysisJob = createServerFn({ method: "POST" })
         analysisId: z.string().min(1),
         image: z.string().min(32).max(8_000_000),
         lang: z.string().max(8).default("fr"),
+        accessToken: accessTokenSchema,
       })
       .parse(d),
   )
   .handler(async ({ data }) => {
+    const request = getRequest();
+    const decision = await checkAiRateLimit("ingredientStart", {
+      request,
+      key: extractClientKey(request?.headers),
+    });
+    if (!decision.allowed) throw rateLimitError("ingredientStart", decision.retryAfterSec);
+
     cleanupExpiredJobs();
 
-    const existing = serverAnalysisJobs.get(data.analysisId);
-    if (existing && (existing.status === "completed" || existing.status === "processing")) {
-      return { analysisId: data.analysisId, status: existing.status };
+    if (!isValidAccessToken(data.accessToken)) {
+      throw new Error("Unauthorized");
     }
 
-    serverAnalysisJobs.set(data.analysisId, {
-      id: data.analysisId,
-      status: "processing",
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
+    // Establish or verify the token<->job binding. A different token on an
+    // existing job is rejected without touching that job's data.
+    const bind = await bindJobToken(data.analysisId, data.accessToken);
+    if (bind === null) throw new Error("Unauthorized");
+
+    if (bind) {
+      // Job already exists and is bound to this token: never overwrite it.
+      return { analysisId: data.analysisId, status: bind.status };
+    }
+
+    createJob(data.analysisId, await hashAccessToken(data.accessToken));
 
     // Run in background on server
     void performAiIngredientAnalysis(data.image, data.lang)
       .then((result) => {
-        serverAnalysisJobs.set(data.analysisId, {
-          id: data.analysisId,
-          status: "completed",
-          result,
-          createdAt: serverAnalysisJobs.get(data.analysisId)?.createdAt || Date.now(),
-          updatedAt: Date.now(),
-        });
+        finalizeJob(data.analysisId, "completed", { result });
       })
       .catch((err) => {
         const errMsg = err instanceof Error ? err.message : String(err);
-        serverAnalysisJobs.set(data.analysisId, {
-          id: data.analysisId,
-          status: "failed",
-          error: errMsg,
-          createdAt: serverAnalysisJobs.get(data.analysisId)?.createdAt || Date.now(),
-          updatedAt: Date.now(),
-        });
+        finalizeJob(data.analysisId, "failed", { error: errMsg });
       });
 
     return { analysisId: data.analysisId, status: "processing" as const };
@@ -256,15 +312,30 @@ export const getIngredientAnalysisJobStatus = createServerFn({ method: "POST" })
     z
       .object({
         analysisId: z.string().min(1),
+        accessToken: accessTokenSchema,
       })
       .parse(d),
   )
   .handler(async ({ data }) => {
+    const request = getRequest();
+    const decision = await checkAiRateLimit("ingredientStatus", {
+      request,
+      key: extractClientKey(request?.headers),
+    });
+    if (!decision.allowed) throw rateLimitError("ingredientStatus", decision.retryAfterSec);
+
     cleanupExpiredJobs();
 
     const job = serverAnalysisJobs.get(data.analysisId);
-    if (!job) {
-      return { analysisId: data.analysisId, status: "pending" as const };
+    // Generic response for "missing" and "wrong token" alike, so an attacker
+    // cannot tell whether an analysisId exists or belongs to someone else.
+    if (!job || !job.tokenHash || !isValidAccessToken(data.accessToken)) {
+      return { analysisId: data.analysisId, status: "unauthorized" as const };
+    }
+
+    const incomingHash = await hashAccessToken(data.accessToken);
+    if (!accessTokenHashesMatch(job.tokenHash, incomingHash)) {
+      return { analysisId: data.analysisId, status: "unauthorized" as const };
     }
 
     return {

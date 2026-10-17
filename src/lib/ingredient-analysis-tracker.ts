@@ -5,12 +5,20 @@ import {
   type IngredientAnalysis,
 } from "./ingredients.functions";
 import { analyse, type ProductResult } from "./halal";
+import { generateAccessToken } from "./ingredient-job-security";
+import { decidePollAction } from "./ingredient-validation";
 
 const STORAGE_KEY = "islam_noor_ingredient_analysis_active_v1";
 const MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
 
 export interface PersistedAnalysisState {
   analysisId: string;
+  /**
+   * Capability token required to read/update this job on the server. Absent in
+   * records created before the access-token mechanism existed; such records
+   * cannot be recovered from the server (see recoverActiveAnalysis).
+   */
+  accessToken?: string;
   status: "pending" | "processing" | "completed" | "failed";
   createdAt: number;
   product?: ProductResult;
@@ -98,6 +106,33 @@ export function formatAnalysisToProduct(
 }
 
 /**
+ * Generates a cryptographically-secure, hard-to-guess analysis identifier.
+ *
+ * Uses the Web Crypto API, available in secure contexts (the Capacitor app runs
+ * on an `https://` scheme and the web build is served over HTTPS):
+ * - prefers `crypto.randomUUID()` (122 bits of entropy);
+ * - falls back to `crypto.getRandomValues()` when `randomUUID` is unavailable;
+ * - never falls back to `Math.random()`: if no CSPRNG is available it throws,
+ *   because a predictable identifier would defeat the purpose of this change.
+ *
+ * The `ing_analysis_` prefix and the string type are preserved so every server
+ * function, the tracker, status polling and the in-memory store keep working.
+ */
+function generateAnalysisId(): string {
+  const webCrypto = typeof crypto !== "undefined" ? crypto : undefined;
+  if (webCrypto && typeof webCrypto.randomUUID === "function") {
+    return `ing_analysis_${webCrypto.randomUUID()}`;
+  }
+  if (webCrypto && typeof webCrypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    webCrypto.getRandomValues(bytes);
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return `ing_analysis_${hex}`;
+  }
+  throw new Error("No cryptographically secure random generator available");
+}
+
+/**
  * Runs a resilient, background-safe ingredient analysis.
  * - Stores state in localStorage before network call.
  * - Starts server job tracking.
@@ -111,12 +146,14 @@ export async function runResilientIngredientAnalysis(
     onProgress?: (msg: string) => void;
   } = {},
 ): Promise<ProductResult> {
-  const analysisId = `ing_analysis_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const analysisId = generateAnalysisId();
+  const accessToken = generateAccessToken();
   const lang = options.lang || "fr";
 
   // 1. Persist initial state
   const initialJob: PersistedAnalysisState = {
     analysisId,
+    accessToken,
     status: "processing",
     createdAt: Date.now(),
     progressMessage: "Analyse des ingrédients par l'IA en cours...",
@@ -132,6 +169,7 @@ export async function runResilientIngredientAnalysis(
           analysisId,
           image: imageDataUrl,
           lang,
+          accessToken,
         },
       });
     } catch (startErr) {
@@ -144,6 +182,7 @@ export async function runResilientIngredientAnalysis(
         image: imageDataUrl,
         lang,
         analysisId,
+        accessToken,
       },
     });
 
@@ -155,14 +194,17 @@ export async function runResilientIngredientAnalysis(
       // Check server job status
       try {
         const check = await Promise.race([
-          getIngredientAnalysisJobStatus({ data: { analysisId } }),
+          getIngredientAnalysisJobStatus({ data: { analysisId, accessToken } }),
           new Promise<null>((resolve) => setTimeout(() => resolve(null), 1400)),
         ]);
 
-        if (check && check.status === "completed" && check.result) {
-          const product = formatAnalysisToProduct(check.result, options.fallbackTitle);
+        const action = decidePollAction(check?.status, Boolean(check?.result));
+
+        if (check && action === "result") {
+          const product = formatAnalysisToProduct(check.result!, options.fallbackTitle);
           saveActiveIngredientAnalysis({
             analysisId,
+            accessToken,
             status: "completed",
             createdAt: initialJob.createdAt,
             product,
@@ -170,8 +212,15 @@ export async function runResilientIngredientAnalysis(
           return product;
         }
 
-        if (check && check.status === "failed") {
-          throw new Error(check.error || "L'analyse des ingrédients a échoué.");
+        if (action === "failed") {
+          throw new Error(check?.error || "L'analyse des ingrédients a échoué.");
+        }
+
+        // P2: "unauthorized" means the server refuses this token for the job.
+        // Stop polling now and fall back to the legitimate direct request below
+        // instead of wasting ~40s of status polling that can never succeed.
+        if (action === "stop") {
+          break;
         }
       } catch (pollErr) {
         console.debug("Status poll check:", pollErr);
@@ -187,6 +236,7 @@ export async function runResilientIngredientAnalysis(
         const product = formatAnalysisToProduct(directResolved.res, options.fallbackTitle);
         saveActiveIngredientAnalysis({
           analysisId,
+          accessToken,
           status: "completed",
           createdAt: initialJob.createdAt,
           product,
@@ -203,6 +253,7 @@ export async function runResilientIngredientAnalysis(
     const product = formatAnalysisToProduct(directResult, options.fallbackTitle);
     saveActiveIngredientAnalysis({
       analysisId,
+      accessToken,
       status: "completed",
       createdAt: initialJob.createdAt,
       product,
@@ -212,6 +263,7 @@ export async function runResilientIngredientAnalysis(
     const errorMsg = err instanceof Error ? err.message : "Erreur pendant l'analyse des ingrédients";
     saveActiveIngredientAnalysis({
       analysisId,
+      accessToken,
       status: "failed",
       createdAt: initialJob.createdAt,
       error: errorMsg,
@@ -246,9 +298,19 @@ export async function recoverActiveAnalysis(
     return { active: true, status: "failed", error: current.error };
   }
 
+  // Legacy local records (created before the access-token mechanism) have no
+  // token and therefore cannot be authorized against the server. Never bypass
+  // the check: drop them so the user can start a fresh analysis.
+  if (!current.accessToken) {
+    clearActiveIngredientAnalysis();
+    return { active: false };
+  }
+
   // If currently processing, query server status
   try {
-    const check = await getIngredientAnalysisJobStatus({ data: { analysisId: current.analysisId } });
+    const check = await getIngredientAnalysisJobStatus({
+      data: { analysisId: current.analysisId, accessToken: current.accessToken },
+    });
     if (check.status === "completed" && check.result) {
       const product = formatAnalysisToProduct(check.result, fallbackTitle);
       clearActiveIngredientAnalysis();
